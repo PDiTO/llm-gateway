@@ -2,7 +2,7 @@
 name = "llm-gateway"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "An OpenAI-compatible gateway in front of several LLM providers, with fallback, circuit breakers, rate limits, spend budgets and a response cache"
 license = "MIT"
 authors = ["Paul Davis"]
