@@ -1,0 +1,34 @@
+{
+  "model": "claude-sonnet-4-5-20250929",
+  "max_tokens": 512,
+  "system": "You are a weather assistant.\n\nAnswer in one sentence.",
+  "messages": [
+    {"role": "user", "content": [
+      {"type": "text", "text": "Compare the weather in Paris and Tokyo."},
+      {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+      {"type": "image", "source": {"type": "url", "url": "https://example.com/map.jpg"}}
+    ]},
+    {"role": "assistant", "content": [
+      {"type": "text", "text": "Let me check both."},
+      {"type": "tool_use", "id": "toolu_01A", "name": "get_weather", "input": {"city": "Paris"}},
+      {"type": "tool_use", "id": "toolu_01B", "name": "get_weather", "input": {"city": "Tokyo"}}
+    ]},
+    {"role": "user", "content": [
+      {"type": "tool_result", "tool_use_id": "toolu_01A", "content": "18C, cloudy"},
+      {"type": "tool_result", "tool_use_id": "toolu_01B", "content": "24C, sunny"},
+      {"type": "text", "text": "Which is warmer?"}
+    ]}
+  ],
+  "temperature": 0.2,
+  "stop_sequences": ["\n\nHuman:"],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Current weather for a city",
+      "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+    },
+    {"name": "get_time", "input_schema": {"type": "object", "properties": {}}}
+  ],
+  "tool_choice": {"type": "any", "disable_parallel_tool_use": true},
+  "metadata": {"user_id": "user-1234"}
+}

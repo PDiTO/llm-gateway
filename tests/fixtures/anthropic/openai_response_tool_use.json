@@ -1,0 +1,26 @@
+{
+  "id": "msg_01Q8Faay6S7QPTvEUUQARt7h",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "claude-sonnet-4-5-20250929",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "I'll look up both cities.",
+        "tool_calls": [
+          {"id": "toolu_01A", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+          {"id": "toolu_01B", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\",\"units\":\"celsius\"}"}}
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 3500,
+    "completion_tokens": 95,
+    "total_tokens": 3595,
+    "prompt_tokens_details": {"cached_tokens": 2000}
+  }
+}
