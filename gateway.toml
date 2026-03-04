@@ -1,0 +1,109 @@
+# Example llm-gateway config. Every field and its default is documented in
+# src/config.rs. Validate a config with `llm-gateway check --config <path>`.
+
+[server]
+listen = "0.0.0.0:8080"
+max_body_bytes = 4194304   # 4 MiB
+shutdown_grace_ms = 30000  # time in-flight requests get after SIGTERM
+
+[retry]
+max_attempts = 2           # tries per target, including the first
+base_delay_ms = 250        # backoff ceiling doubles from here, with full jitter
+max_delay_ms = 4000
+max_retry_after_ms = 10000 # a longer Retry-After skips to the next target instead of waiting
+
+[circuit_breaker]
+failure_threshold = 5      # consecutive failures before a provider is skipped
+cooldown_ms = 30000        # then one probe request is let through
+
+[cache]
+enabled = true             # only non-streaming requests with temperature 0
+max_entries = 1000
+ttl_secs = 300
+
+# --- Providers --------------------------------------------------------------
+
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+timeout_ms = 120000
+
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+timeout_ms = 120000
+
+# Any OpenAI-compatible server works too. Local ones usually need no key.
+# [providers.local]
+# kind = "openai"
+# base_url = "http://localhost:11434/v1"
+
+# --- Routes -----------------------------------------------------------------
+# Clients send the route name as `model`. Targets are tried in order.
+
+[[models]]
+name = "smart"
+targets = [
+  # Drop sampling parameters for these targets to avoid incompatible
+  # combinations on Anthropic and unsupported parameters on GPT-5.
+  { provider = "anthropic", model = "claude-sonnet-4-5-20250929", drop_params = ["temperature", "top_p"] },
+  { provider = "openai", model = "gpt-5", drop_params = ["temperature", "top_p"] },
+]
+
+[[models]]
+name = "fast"
+targets = [
+  { provider = "anthropic", model = "claude-haiku-4-5-20251001", timeout_ms = 30000 },
+  { provider = "openai", model = "gpt-5-mini", timeout_ms = 30000, drop_params = ["temperature", "top_p"] },
+]
+
+# A route can also be named after the real model, with a single target.
+[[models]]
+name = "claude-sonnet-4-5-20250929"
+targets = [{ provider = "anthropic", model = "claude-sonnet-4-5-20250929", drop_params = ["temperature", "top_p"] }]
+
+# --- Prices -----------------------------------------------------------------
+# USD per million tokens, keyed by upstream model ID. Check each provider's
+# pricing page before relying on these; they change.
+
+[prices."claude-sonnet-4-5-20250929"]
+input_per_mtok = 2.00
+output_per_mtok = 10.00
+cached_input_per_mtok = 0.20
+
+[prices."claude-haiku-4-5-20251001"]
+input_per_mtok = 1.00
+output_per_mtok = 5.00
+cached_input_per_mtok = 0.10
+
+[prices."gpt-5"]
+input_per_mtok = 1.25
+output_per_mtok = 10.00
+cached_input_per_mtok = 0.125
+
+[prices."gpt-5-mini"]
+input_per_mtok = 0.25
+output_per_mtok = 2.00
+cached_input_per_mtok = 0.025
+
+# --- Gateway keys -----------------------------------------------------------
+# Only SHA-256 hashes go in the config. `llm-gateway gen-key` makes a new key
+# and prints its hash; `llm-gateway hash-key <key>` hashes an existing one.
+
+# Plaintext for local testing: sk-gw-local-dev-key. Replace it before
+# exposing the gateway anywhere.
+[[keys]]
+name = "local-dev"
+key_sha256 = "0aa0e62bf20dcb7164fae29389a20211e478364686d319676b38d3a89b4611f3"
+requests_per_minute = 60
+daily_budget_usd = 5.00
+
+# A key made with `llm-gateway gen-key`; only its hash is kept here. Higher
+# rate limit with a bounded burst, and no daily budget.
+[[keys]]
+name = "batch-jobs"
+key_sha256 = "8f6582930712097263b025371bb8b65b87cf0e36761ab67ccf11035164f351e7"
+requests_per_minute = 600
+burst = 50

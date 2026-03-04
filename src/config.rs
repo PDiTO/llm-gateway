@@ -864,6 +864,15 @@ mod tests {
     }
 
     #[test]
+    fn example_config_in_the_repo_is_valid() {
+        let config =
+            Config::from_toml_with_env(include_str!("../gateway.toml"), |_| Some("sk-test".into()))
+                .unwrap();
+        assert_eq!(config.warnings(), Vec::<String>::new());
+        assert!(config.models.iter().any(|m| m.name == "smart"));
+    }
+
+    #[test]
     fn distinct_hashes_are_accepted() {
         let text = format!(
             "{}\n[[keys]]\nname = \"other\"\nkey_sha256 = \"{HASH_B}\"\nrequests_per_minute = 1\n",
