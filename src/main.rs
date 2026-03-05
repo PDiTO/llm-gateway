@@ -45,9 +45,11 @@ enum Command {
     /// Validate the config file and print any warnings.
     Check,
     /// Print the SHA-256 hash to put in a [[keys]] entry for an existing key.
+    /// Reads the key from stdin if it isn't given, which keeps it out of shell
+    /// history and the process list.
     HashKey {
         /// The plaintext key.
-        key: String,
+        key: Option<String>,
     },
     /// Generate a new random key and print it with its hash.
     GenKey,
@@ -80,7 +82,23 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Serve) {
         Command::HashKey { key } => {
-            println!("{}", auth::hash_key(&key));
+            let key = match key {
+                Some(key) => key,
+                None => {
+                    let mut line = String::new();
+                    if let Err(e) = std::io::stdin().read_line(&mut line) {
+                        eprintln!("error: could not read the key from stdin: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    line
+                }
+            };
+            let key = key.trim();
+            if key.is_empty() {
+                eprintln!("error: empty key");
+                return ExitCode::FAILURE;
+            }
+            println!("{}", auth::hash_key(key));
             ExitCode::SUCCESS
         }
         Command::GenKey => {

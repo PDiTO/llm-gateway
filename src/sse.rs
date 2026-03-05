@@ -15,12 +15,27 @@ pub struct SseEvent {
     pub data: String,
 }
 
-#[derive(Debug, Default)]
+/// Upper bound on a single event, so a misbehaving upstream that never sends
+/// a newline can't make the gateway buffer without limit.
+pub const DEFAULT_MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("upstream sent an SSE event larger than {0} bytes")]
+pub struct EventTooLarge(pub usize);
+
+#[derive(Debug)]
 pub struct SseParser {
     line: Vec<u8>,
     event: Option<String>,
     data: String,
     has_data: bool,
+    max_event_bytes: usize,
+}
+
+impl Default for SseParser {
+    fn default() -> Self {
+        Self::with_max_event_bytes(DEFAULT_MAX_EVENT_BYTES)
+    }
 }
 
 impl SseParser {
@@ -28,35 +43,47 @@ impl SseParser {
         Self::default()
     }
 
-    /// Feeds a chunk of bytes and returns any events it completed.
-    pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
-        let mut events = Vec::new();
-        for &byte in chunk {
-            if byte == b'\n' {
-                let mut line = std::mem::take(&mut self.line);
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                if let Some(event) = self.process_line(&line) {
-                    events.push(event);
-                }
-            } else {
-                self.line.push(byte);
-            }
+    pub fn with_max_event_bytes(max_event_bytes: usize) -> Self {
+        Self {
+            line: Vec::new(),
+            event: None,
+            data: String::new(),
+            has_data: false,
+            max_event_bytes,
         }
-        events
     }
 
-    /// Call when the body ends. Returns a final event if the stream stopped
-    /// without the trailing blank line.
-    pub fn finish(&mut self) -> Option<SseEvent> {
-        if !self.line.is_empty() {
-            let line = std::mem::take(&mut self.line);
-            if let Some(event) = self.process_line(&line) {
-                return Some(event);
+    /// Feeds a chunk of bytes and returns any events it completed.
+    ///
+    /// When the body ends, whatever is still buffered is an incomplete event.
+    /// The spec says to discard it, so there is no `finish` step: a stream cut
+    /// off mid-event never produces half an event.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, EventTooLarge> {
+        let mut events = Vec::new();
+        let mut rest = chunk;
+        while let Some(newline) = rest.iter().position(|&b| b == b'\n') {
+            self.line.extend_from_slice(&rest[..newline]);
+            rest = &rest[newline + 1..];
+            let mut line = std::mem::take(&mut self.line);
+            if line.last() == Some(&b'\r') {
+                line.pop();
             }
+            if let Some(event) = self.process_line(&line) {
+                events.push(event);
+            }
+            self.check_size()?;
         }
-        self.dispatch()
+        self.line.extend_from_slice(rest);
+        self.check_size()?;
+        Ok(events)
+    }
+
+    fn check_size(&self) -> Result<(), EventTooLarge> {
+        if self.line.len() + self.data.len() > self.max_event_bytes {
+            Err(EventTooLarge(self.max_event_bytes))
+        } else {
+            Ok(())
+        }
     }
 
     fn process_line(&mut self, line: &[u8]) -> Option<SseEvent> {
@@ -117,10 +144,7 @@ mod tests {
     use super::*;
 
     fn parse_all(input: &[u8]) -> Vec<SseEvent> {
-        let mut parser = SseParser::new();
-        let mut events = parser.push(input);
-        events.extend(parser.finish());
-        events
+        SseParser::new().push(input).unwrap()
     }
 
     fn ev(event: Option<&str>, data: &str) -> SseEvent {
@@ -173,19 +197,33 @@ mod tests {
             let mut parser = SseParser::new();
             let mut events = Vec::new();
             for chunk in input.as_bytes().chunks(chunk_size) {
-                events.extend(parser.push(chunk));
+                events.extend(parser.push(chunk).unwrap());
             }
-            events.extend(parser.finish());
             assert_eq!(events, expected, "chunk size {chunk_size}");
         }
     }
 
     #[test]
-    fn finish_flushes_an_unterminated_event() {
+    fn unterminated_event_is_never_dispatched() {
         let mut parser = SseParser::new();
-        assert!(parser.push(b"data: partial").is_empty());
-        assert_eq!(parser.finish(), Some(ev(None, "partial")));
-        assert_eq!(parser.finish(), None);
+        assert!(parser.push(b"data: {\"partial\": tr").unwrap().is_empty());
+        assert!(parser.push(b"ue}\n").unwrap().is_empty());
+        // Only the blank line completes it.
+        assert_eq!(
+            parser.push(b"\n").unwrap(),
+            vec![ev(None, r#"{"partial": true}"#)]
+        );
+    }
+
+    #[test]
+    fn oversized_events_are_rejected() {
+        let mut parser = SseParser::with_max_event_bytes(16);
+        assert!(parser.push(b"data: short\n\n").is_ok());
+        assert_eq!(parser.push(&[b'x'; 17]), Err(EventTooLarge(16)));
+
+        let mut parser = SseParser::with_max_event_bytes(16);
+        let many_lines = b"data: 0123456789\ndata: 0123456789\n";
+        assert!(parser.push(many_lines).is_err());
     }
 
     #[test]

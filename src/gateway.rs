@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use crate::auth::{KeyState, KeyStore};
 use crate::backoff::{self, Backoff};
 use crate::cache::{self, CachedResponse, ResponseCache};
-use crate::circuit::{CircuitBreaker, CircuitState};
+use crate::circuit::{CircuitBreaker, CircuitState, Permit};
 use crate::clock::{Clock, SystemClock};
 use crate::config::{Config, RetryConfig, Target};
 use crate::cost::PriceTable;
@@ -30,6 +30,12 @@ pub const HEADER_MODEL: &str = "x-gateway-model";
 pub const HEADER_ATTEMPTS: &str = "x-gateway-attempts";
 pub const HEADER_CACHE: &str = "x-gateway-cache";
 pub const HEADER_COST: &str = "x-gateway-cost-usd";
+
+/// Largest successful non-streaming body the gateway will read from an upstream.
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+/// Largest error body the gateway will read. Error bodies are short; this
+/// only guards against an upstream sending something huge with a 5xx.
+const MAX_ERROR_BYTES: usize = 64 * 1024;
 
 pub struct Upstream {
     pub provider: Provider,
@@ -62,7 +68,9 @@ enum Reply {
         body: Bytes,
         usage: Option<TokenUsage>,
     },
-    Stream(reqwest::Response),
+    /// The permit travels with the stream, so the circuit hears how the
+    /// stream ended rather than only that it started.
+    Stream(reqwest::Response, Permit),
 }
 
 struct Served<'a> {
@@ -73,18 +81,22 @@ struct Served<'a> {
 }
 
 enum AttemptError {
-    /// The upstream is unhealthy or overloaded. Counts against its circuit.
+    /// This target couldn't serve the request; another one might.
     Failed {
         reason: String,
         outcome: &'static str,
         retry_after: Option<Duration>,
         /// False when retrying the same upstream is pointless (bad
-        /// credentials), but another target might still work.
+        /// credentials, unknown model), but another target might still work.
         retry_same_target: bool,
+        /// False when the upstream answered sensibly and so shouldn't be
+        /// counted as unhealthy (a 404 for a model it doesn't have).
+        counts_against_circuit: bool,
         kind: FailureKind,
     },
-    /// The upstream rejected the request itself (400, 404, 422...). Every
-    /// other target would too, so this goes straight back to the client.
+    /// The upstream rejected the request itself (400, 422...). Other targets
+    /// get the same messages and parameters, so this goes straight back to
+    /// the client.
     Rejected { status: StatusCode, body: Value },
 }
 
@@ -93,6 +105,10 @@ enum FailureKind {
     CircuitOpen,
     RateLimited,
     Timeout,
+    /// The upstream doesn't know the model.
+    NotFound,
+    /// The request can't be expressed for this target's API.
+    Unsupported,
     Other,
 }
 
@@ -139,6 +155,10 @@ impl Gateway {
         });
         let http = reqwest::Client::builder()
             .tcp_nodelay(true)
+            // Redirects would carry provider credentials (x-api-key, custom
+            // headers) and request bodies to another host. No LLM API
+            // redirects a POST, so treat one as an error instead.
+            .redirect(reqwest::redirect::Policy::none())
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .expect("HTTP client configuration is static and valid");
@@ -380,19 +400,39 @@ impl Gateway {
                     Some(cost),
                 ))
             }
-            Reply::Stream(upstream_response) => {
+            Reply::Stream(upstream_response, permit) => {
                 let gateway = Arc::clone(self);
                 let key_for_billing = Arc::clone(&key);
-                let (model_log, provider_log, upstream_model_log) = (
+                let (model_log, provider_log, upstream_model_log, request_id_log) = (
                     model.to_string(),
                     provider_name.clone(),
                     upstream_model.clone(),
+                    request_id.to_string(),
                 );
                 let started = Instant::now();
                 let recorder = StreamRecorder::new(move |summary: StreamSummary| {
+                    // A client hanging up says nothing about the upstream, so
+                    // only upstream errors count against the circuit.
+                    let transition = if summary.error.is_some() {
+                        gateway.record_attempt(&provider_log, "stream_failed");
+                        permit.failure()
+                    } else {
+                        permit.success()
+                    };
+                    gateway.note_transition(&provider_log, transition);
+                    if summary.usage.is_none() {
+                        gateway
+                            .metrics
+                            .unbilled_streams
+                            .with_label_values(&[provider_log.as_str()])
+                            .inc();
+                    }
                     let cost =
                         gateway.account(&key_for_billing, &upstream_model_log, summary.usage);
+                    // The body outlives the request span, so the request ID
+                    // is logged explicitly here.
                     info!(
+                        request_id = %request_id_log,
                         key = %key_for_billing.name,
                         model = %model_log,
                         provider = %provider_log,
@@ -456,6 +496,11 @@ impl Gateway {
                 .with_label_values(&labels("cached_prompt"))
                 .inc_by(usage.cached_prompt_tokens);
         }
+        if usage.cache_write_prompt_tokens > 0 {
+            tokens
+                .with_label_values(&labels("cache_write_prompt"))
+                .inc_by(usage.cache_write_prompt_tokens);
+        }
         let cost = self.prices.cost(upstream_model, usage).unwrap_or(0.0);
         if cost > 0.0 {
             self.metrics
@@ -480,6 +525,7 @@ impl Gateway {
     ) -> Result<Served<'a>, DispatchError> {
         let mut failures: Vec<String> = Vec::new();
         let mut kinds: Vec<FailureKind> = Vec::new();
+        let mut unsupported: Option<ApiError> = None;
         let mut last_retry_after = None;
         let mut attempts = 0u32;
 
@@ -501,37 +547,52 @@ impl Gateway {
 
             for attempt in 0..self.retry.max_attempts {
                 let Some(permit) = upstream.breaker.try_acquire() else {
-                    self.metrics
-                        .upstream_attempts
-                        .with_label_values(&[target.provider.as_str(), "circuit_open"])
-                        .inc();
-                    failures.push(format!(
-                        "{} ({}): circuit open",
-                        target.provider, target.model
-                    ));
-                    kinds.push(FailureKind::CircuitOpen);
-                    last_retry_after = Some(upstream.breaker.retry_in());
+                    // If the circuit opened during our own retries, the
+                    // failure that opened it is already recorded.
+                    if attempt == 0 {
+                        self.record_attempt(&target.provider, "circuit_open");
+                        failures.push(format!(
+                            "{} ({}): circuit open",
+                            target.provider, target.model
+                        ));
+                        kinds.push(FailureKind::CircuitOpen);
+                        last_retry_after = Some(upstream.breaker.retry_in());
+                    }
                     break;
                 };
-                // Translate once per target, and only if we get this far.
+                // Translate once per target, and only if we get this far. A
+                // request this target's API can't express (say `n: 2` for
+                // Anthropic) may still suit a later target.
                 let body = match &body {
                     Some(body) => Bytes::clone(body),
-                    None => {
-                        let prepared = upstream
-                            .provider
-                            .prepare_body(request, target, stream)
-                            .map_err(DispatchError::Api)?;
-                        body.insert(prepared).clone()
-                    }
+                    None => match upstream.provider.prepare_body(request, target, stream) {
+                        Ok(prepared) => body.insert(prepared).clone(),
+                        Err(err) => {
+                            drop(permit);
+                            failures.push(format!(
+                                "{} ({}): {}",
+                                target.provider, target.model, err.message
+                            ));
+                            kinds.push(FailureKind::Unsupported);
+                            unsupported.get_or_insert(err);
+                            break;
+                        }
+                    },
                 };
                 attempts += 1;
                 let result = self
                     .attempt(upstream, body, stream, timeout, request_id)
                     .await;
                 match result {
-                    Ok(reply) => {
+                    Ok(fetched) => {
                         self.record_attempt(&target.provider, "success");
-                        self.note_transition(&target.provider, permit.success());
+                        let reply = match fetched {
+                            Fetched::Json { body, usage } => {
+                                self.note_transition(&target.provider, permit.success());
+                                Reply::Json { body, usage }
+                            }
+                            Fetched::Stream(response) => Reply::Stream(response, permit),
+                        };
                         return Ok(Served {
                             upstream,
                             target,
@@ -555,10 +616,16 @@ impl Gateway {
                         outcome,
                         retry_after,
                         retry_same_target,
+                        counts_against_circuit,
                         kind,
                     }) => {
                         self.record_attempt(&target.provider, outcome);
-                        self.note_transition(&target.provider, permit.failure());
+                        let transition = if counts_against_circuit {
+                            permit.failure()
+                        } else {
+                            permit.success()
+                        };
+                        self.note_transition(&target.provider, transition);
                         warn!(
                             provider = %target.provider,
                             upstream_model = %target.model,
@@ -596,6 +663,7 @@ impl Gateway {
             &failures,
             &kinds,
             last_retry_after,
+            unsupported,
         )))
     }
 
@@ -606,7 +674,7 @@ impl Gateway {
         stream: bool,
         timeout: Duration,
         request_id: &str,
-    ) -> Result<Reply, AttemptError> {
+    ) -> Result<Fetched, AttemptError> {
         let provider = &upstream.provider;
         let request = provider.build_request(&self.http, body, request_id);
         let exchange = async {
@@ -614,56 +682,92 @@ impl Gateway {
             let status = response.status();
             if status.is_success() {
                 if stream {
-                    return Ok(Reply::Stream(response));
+                    return Ok(Fetched::Stream(response));
                 }
-                let bytes = response.bytes().await.map_err(network_failure)?;
-                let (body, usage) =
-                    provider
-                        .parse_response(&bytes, self.unix_now())
-                        .map_err(|e| AttemptError::Failed {
-                            reason: format!("unusable response body: {e}"),
-                            outcome: "bad_response",
-                            retry_after: None,
-                            retry_same_target: true,
-                            kind: FailureKind::Other,
-                        })?;
-                return Ok(Reply::Json { body, usage });
+                let bad_response = |reason: String| AttemptError::Failed {
+                    reason,
+                    outcome: "bad_response",
+                    retry_after: None,
+                    retry_same_target: true,
+                    counts_against_circuit: true,
+                    kind: FailureKind::Other,
+                };
+                let bytes = read_body(response, MAX_RESPONSE_BYTES)
+                    .await
+                    .map_err(|e| match e {
+                        BodyError::Network(e) => network_failure(e),
+                        BodyError::TooLarge => bad_response(format!(
+                            "response body is larger than {MAX_RESPONSE_BYTES} bytes"
+                        )),
+                    })?;
+                let (body, usage) = provider
+                    .parse_response(&bytes, self.unix_now())
+                    .map_err(|e| bad_response(format!("unusable response body: {e}")))?;
+                return Ok(Fetched::Json { body, usage });
             }
 
             let retry_after =
                 backoff::retry_after(response.headers(), UNIX_EPOCH + self.clock.unix_time());
-            let bytes = response.bytes().await.unwrap_or_default();
+            let bytes = read_body(response, MAX_ERROR_BYTES)
+                .await
+                .unwrap_or_default();
             let snippet = error_snippet(&bytes);
-            match status.as_u16() {
-                429 => Err(AttemptError::Failed {
-                    reason: format!("HTTP 429{snippet}"),
-                    outcome: "rate_limited",
+            let code = status.as_u16();
+            let failed = |outcome, kind, retry_same_target, counts_against_circuit, reason| {
+                Err(AttemptError::Failed {
+                    reason,
+                    outcome,
                     retry_after,
-                    retry_same_target: true,
-                    kind: FailureKind::RateLimited,
-                }),
-                408 | 500..=599 => Err(AttemptError::Failed {
-                    reason: format!("HTTP {}{snippet}", status.as_u16()),
-                    outcome: "server_error",
-                    retry_after,
-                    retry_same_target: true,
-                    kind: FailureKind::Other,
-                }),
+                    retry_same_target,
+                    counts_against_circuit,
+                    kind,
+                })
+            };
+            match code {
+                429 => failed(
+                    "rate_limited",
+                    FailureKind::RateLimited,
+                    true,
+                    true,
+                    format!("HTTP 429{snippet}"),
+                ),
+                408 | 500..=599 => failed(
+                    "server_error",
+                    FailureKind::Other,
+                    true,
+                    true,
+                    format!("HTTP {code}{snippet}"),
+                ),
                 // The gateway's credentials for this provider are wrong. That
                 // won't fix itself on retry, but another provider may work.
-                401 | 403 => Err(AttemptError::Failed {
-                    reason: format!(
-                        "HTTP {} (check this provider's API key){snippet}",
-                        status.as_u16()
-                    ),
-                    outcome: "auth_error",
-                    retry_after: None,
-                    retry_same_target: false,
-                    kind: FailureKind::Other,
-                }),
+                401 | 403 => failed(
+                    "auth_error",
+                    FailureKind::Other,
+                    false,
+                    true,
+                    format!("HTTP {code} (check this provider's API key){snippet}"),
+                ),
+                // Usually a model ID this upstream doesn't serve. Targets use
+                // different model IDs, so the next one may be fine, and the
+                // upstream itself is healthy.
+                404 => failed(
+                    "not_found",
+                    FailureKind::NotFound,
+                    false,
+                    false,
+                    format!("HTTP 404{snippet}"),
+                ),
+                // Redirects are not followed (see the client builder), and no
+                // LLM API should send one. Most likely a wrong base_url.
+                300..=399 => failed(
+                    "redirect",
+                    FailureKind::Other,
+                    false,
+                    true,
+                    format!("unexpected redirect, HTTP {code} (check base_url)"),
+                ),
                 _ => Err(AttemptError::Rejected {
-                    status: StatusCode::from_u16(status.as_u16())
-                        .unwrap_or(StatusCode::BAD_GATEWAY),
+                    status: StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
                     body: provider.error_body(&bytes),
                 }),
             }
@@ -675,6 +779,7 @@ impl Gateway {
                 outcome: "timeout",
                 retry_after: None,
                 retry_same_target: true,
+                counts_against_circuit: true,
                 kind: FailureKind::Timeout,
             }),
         }
@@ -714,8 +819,41 @@ fn network_failure(err: reqwest::Error) -> AttemptError {
         outcome,
         retry_after: None,
         retry_same_target: true,
+        counts_against_circuit: true,
         kind,
     }
+}
+
+/// What a successful attempt produced, before the circuit permit is attached.
+enum Fetched {
+    Json {
+        body: Bytes,
+        usage: Option<TokenUsage>,
+    },
+    Stream(reqwest::Response),
+}
+
+enum BodyError {
+    Network(reqwest::Error),
+    TooLarge,
+}
+
+/// Reads a response body, refusing to buffer more than `limit` bytes.
+async fn read_body(mut response: reqwest::Response, limit: usize) -> Result<Bytes, BodyError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > limit as u64)
+    {
+        return Err(BodyError::TooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(BodyError::Network)? {
+        if body.len() + chunk.len() > limit {
+            return Err(BodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
 }
 
 /// First part of an upstream error body, for logs and the final error message.
@@ -732,22 +870,38 @@ fn error_snippet(body: &[u8]) -> String {
 }
 
 /// The error returned when every target failed. The status reflects what
-/// went wrong: 429 if the last upstream was rate limiting (so clients back
-/// off), 503 if every circuit was open, 504 on a timeout, 502 otherwise.
+/// went wrong: 400 if no target could express the request at all, 404 if
+/// every upstream said it didn't know the model, 503 if every circuit was
+/// open, 429 if the last upstream was rate limiting (so clients back off),
+/// 504 on a timeout, and 502 otherwise.
 fn exhausted(
     model: &str,
     failures: &[String],
     kinds: &[FailureKind],
     last_retry_after: Option<Duration>,
+    unsupported: Option<ApiError>,
 ) -> ApiError {
+    let tried: Vec<FailureKind> = kinds
+        .iter()
+        .copied()
+        .filter(|k| *k != FailureKind::Unsupported)
+        .collect();
+    if tried.is_empty()
+        && let Some(err) = unsupported
+    {
+        return err;
+    }
     let message = format!(
         "all upstream targets for model {model:?} failed: {}",
         failures.join("; ")
     );
-    let last = kinds.last().copied().unwrap_or(FailureKind::Other);
-    let error = if kinds.iter().all(|k| *k == FailureKind::CircuitOpen) {
+    let last = tried.last().copied().unwrap_or(FailureKind::Other);
+    let error = if tried.iter().all(|k| *k == FailureKind::CircuitOpen) {
         ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "upstream_error", message)
             .with_code("circuit_open")
+    } else if tried.iter().all(|k| *k == FailureKind::NotFound) {
+        ApiError::new(StatusCode::NOT_FOUND, "invalid_request_error", message)
+            .with_code("model_not_found")
     } else {
         match last {
             FailureKind::RateLimited => {
@@ -808,7 +962,7 @@ mod tests {
     #[test]
     fn exhausted_status_follows_the_failures() {
         let failures = vec!["a".to_string(), "b".to_string()];
-        let status = |kinds: &[FailureKind]| exhausted("m", &failures, kinds, None).status;
+        let status = |kinds: &[FailureKind]| exhausted("m", &failures, kinds, None, None).status;
         assert_eq!(
             status(&[FailureKind::Other, FailureKind::RateLimited]),
             StatusCode::TOO_MANY_REQUESTS
@@ -825,6 +979,32 @@ mod tests {
             status(&[FailureKind::RateLimited, FailureKind::Other]),
             StatusCode::BAD_GATEWAY
         );
+        assert_eq!(
+            status(&[FailureKind::NotFound, FailureKind::NotFound]),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(&[FailureKind::NotFound, FailureKind::Other]),
+            StatusCode::BAD_GATEWAY
+        );
+        // Untranslatable targets are ignored when others were tried.
+        assert_eq!(
+            status(&[FailureKind::Unsupported, FailureKind::Timeout]),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn untranslatable_everywhere_returns_the_translation_error() {
+        let err = exhausted(
+            "m",
+            &["a (m1): n > 1 is not supported".into()],
+            &[FailureKind::Unsupported],
+            None,
+            Some(ApiError::invalid_request("n > 1 is not supported")),
+        );
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "n > 1 is not supported");
     }
 
     #[test]
@@ -836,6 +1016,7 @@ mod tests {
                 "b (m2): timed out after 100ms".into(),
             ],
             &[FailureKind::Other, FailureKind::Timeout],
+            None,
             None,
         );
         assert_eq!(
@@ -851,6 +1032,7 @@ mod tests {
             &["x".into()],
             &[FailureKind::RateLimited],
             Some(Duration::from_secs(20)),
+            None,
         );
         assert_eq!(err.retry_after, Some(Duration::from_secs(20)));
         let err = exhausted(
@@ -858,6 +1040,7 @@ mod tests {
             &["x".into()],
             &[FailureKind::Other],
             Some(Duration::from_secs(20)),
+            None,
         );
         assert_eq!(err.retry_after, None);
     }

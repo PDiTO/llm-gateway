@@ -252,7 +252,9 @@ pub fn anthropic_message(text: &str, input_tokens: u64, output_tokens: u64) -> V
     })
 }
 
-/// An OpenAI stream: one chunk per word, then a usage chunk and `[DONE]`.
+/// An OpenAI stream as OpenAI sends it with `include_usage` on (which the
+/// gateway always sets): one chunk per word, each with `"usage":null`, then a
+/// usage-only chunk and `[DONE]`.
 pub fn openai_stream(words: &[&str], prompt_tokens: u64, completion_tokens: u64) -> Vec<String> {
     let mut chunks = Vec::new();
     let chunk = |delta: Value, finish: Value| {
@@ -260,7 +262,8 @@ pub fn openai_stream(words: &[&str], prompt_tokens: u64, completion_tokens: u64)
             "data: {}\n\n",
             json!({
                 "id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 1, "model": "mock-model",
-                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                "usage": null
             })
         )
     };
@@ -393,7 +396,7 @@ pub async fn read_sse(response: reqwest::Response) -> Vec<(String, Instant)> {
     while let Some(chunk) = body.next().await {
         let chunk = chunk.unwrap();
         let now = Instant::now();
-        for event in parser.push(&chunk) {
+        for event in parser.push(&chunk).unwrap() {
             out.push((event.data, now));
         }
     }

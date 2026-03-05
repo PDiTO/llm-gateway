@@ -25,6 +25,7 @@ pub struct Provider {
     default_max_tokens: u32,
     extra_headers: HeaderMap,
     pub timeout: Duration,
+    stream_idle_timeout: Duration,
 }
 
 impl Provider {
@@ -55,6 +56,7 @@ impl Provider {
             default_max_tokens: config.default_max_tokens,
             extra_headers,
             timeout: Duration::from_millis(config.timeout_ms),
+            stream_idle_timeout: Duration::from_millis(config.stream_idle_timeout_ms),
         }
     }
 
@@ -191,22 +193,24 @@ impl Provider {
     ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
         let upstream = response.bytes_stream().boxed();
         let handler: Box<dyn EventHandler> = match self.kind {
-            ProviderKind::OpenAi => Box::new(OpenAiPassthrough {
-                include_usage,
-                usage: None,
-                done: false,
-            }),
+            ProviderKind::OpenAi => Box::new(OpenAiPassthrough::new(include_usage)),
             ProviderKind::Anthropic => Box::new(AnthropicAdapter {
                 translator: StreamTranslator::new(include_usage, created),
             }),
         };
-        relay(upstream, handler, recorder)
+        relay(upstream, handler, recorder, self.stream_idle_timeout)
     }
 }
 
 /// What a finished (or abandoned) stream reports for billing and logs.
+///
+/// `error` is only set for upstream problems: a transport error, an idle
+/// timeout, an error event, or the body ending early. A client that
+/// disconnects leaves `completed == false` with no error.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamSummary {
+    /// Usage as far as the upstream reported it. OpenAI only sends usage in
+    /// the final chunk, so an OpenAI stream cut short has none.
     pub usage: Option<TokenUsage>,
     /// The upstream sent its end-of-stream marker.
     pub completed: bool,
@@ -242,7 +246,10 @@ trait EventHandler: Send {
     /// Payloads to send to the client for one upstream event.
     fn on_event(&mut self, event: &SseEvent) -> Vec<String>;
     fn usage(&self) -> Option<TokenUsage>;
+    /// The upstream ended the stream, normally or with an error event.
     fn is_finished(&self) -> bool;
+    /// The upstream's own error, if it ended the stream with one.
+    fn failure(&self) -> Option<String>;
     /// Called when the upstream fails or ends early; returns a final payload.
     fn fail(&mut self, message: &str) -> Vec<String>;
 }
@@ -251,6 +258,18 @@ struct OpenAiPassthrough {
     include_usage: bool,
     usage: Option<TokenUsage>,
     done: bool,
+    failure: Option<String>,
+}
+
+impl OpenAiPassthrough {
+    fn new(include_usage: bool) -> Self {
+        Self {
+            include_usage,
+            usage: None,
+            done: false,
+            failure: None,
+        }
+    }
 }
 
 impl EventHandler for OpenAiPassthrough {
@@ -258,27 +277,47 @@ impl EventHandler for OpenAiPassthrough {
         if self.done {
             return Vec::new();
         }
-        if event.data == "[DONE]" {
+        let data = event.data.as_str();
+        if data == "[DONE]" {
             self.done = true;
-            return vec![event.data.clone()];
+            return vec![data.to_string()];
         }
-        // Forward the upstream payload verbatim. Only chunks that mention
-        // usage are parsed, which skips the JSON work for almost every chunk.
-        if event.data.contains("\"usage\"")
-            && let Ok(chunk) = serde_json::from_str::<Value>(&event.data)
-            && let Some(usage) = chunk.get("usage").and_then(TokenUsage::from_openai)
-        {
-            self.usage = Some(usage);
-            let no_choices = chunk
-                .get("choices")
-                .and_then(Value::as_array)
-                .is_none_or(Vec::is_empty);
-            if no_choices && !self.include_usage {
-                // We added include_usage ourselves; hide the extra chunk.
-                return Vec::new();
+        // An upstream error mid-stream. Pass it on and treat the stream as
+        // over.
+        if data.starts_with(r#"{"error""#) {
+            self.done = true;
+            self.failure = Some(format!("upstream error event: {data}"));
+            return vec![data.to_string()];
+        }
+        // With include_usage on, OpenAI puts `"usage":null` in every chunk and
+        // a real usage object only in the last one. Only that one is parsed.
+        if data.contains(r#""usage":{"#) || data.contains(r#""usage": {"#) {
+            if let Ok(chunk) = serde_json::from_str::<Value>(data)
+                && let Some(usage) = chunk.get("usage").and_then(TokenUsage::from_openai)
+            {
+                self.usage = Some(usage);
+                let no_choices = chunk
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty);
+                if no_choices && !self.include_usage {
+                    // The gateway asked for this chunk, not the client.
+                    return Vec::new();
+                }
+            }
+            return vec![data.to_string()];
+        }
+        if !self.include_usage {
+            // Also hide the per-chunk `"usage":null` the client didn't ask
+            // for. OpenAI sends compact JSON, so a string edit is enough and
+            // saves parsing every chunk; anything else is forwarded as is.
+            for null_field in [r#","usage":null"#, r#""usage":null,"#] {
+                if data.contains(null_field) {
+                    return vec![data.replacen(null_field, "", 1)];
+                }
             }
         }
-        vec![event.data.clone()]
+        vec![data.to_string()]
     }
 
     fn usage(&self) -> Option<TokenUsage> {
@@ -287,6 +326,10 @@ impl EventHandler for OpenAiPassthrough {
 
     fn is_finished(&self) -> bool {
         self.done
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.failure.clone()
     }
 
     fn fail(&mut self, message: &str) -> Vec<String> {
@@ -315,6 +358,10 @@ impl EventHandler for AnthropicAdapter {
         self.translator.is_finished()
     }
 
+    fn failure(&self) -> Option<String> {
+        self.translator.failure().map(str::to_string)
+    }
+
     fn fail(&mut self, message: &str) -> Vec<String> {
         self.translator.fail("upstream_error", message)
     }
@@ -324,29 +371,33 @@ fn relay(
     mut upstream: futures_util::stream::BoxStream<'static, reqwest::Result<Bytes>>,
     mut handler: Box<dyn EventHandler>,
     mut recorder: StreamRecorder,
+    idle_timeout: Duration,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
     async_stream::stream! {
         let mut parser = SseParser::new();
-        let mut failed = false;
+        let mut error: Option<String> = None;
         'read: loop {
-            let events = match upstream.next().await {
-                Some(Ok(chunk)) => parser.push(&chunk),
-                Some(Err(e)) => {
-                    let message = format!("upstream stream failed: {e}");
-                    for payload in handler.fail(&message) {
-                        yield Ok(encode_data(&payload));
-                    }
-                    recorder.summary.error = Some(message);
-                    failed = true;
+            let chunk = match tokio::time::timeout(idle_timeout, upstream.next()).await {
+                Err(_) => {
+                    error = Some(format!(
+                        "upstream sent nothing for {}ms",
+                        idle_timeout.as_millis()
+                    ));
                     break 'read;
                 }
-                None => {
-                    let events: Vec<SseEvent> = parser.finish().into_iter().collect();
-                    for event in &events {
-                        for payload in handler.on_event(event) {
-                            yield Ok(encode_data(&payload));
-                        }
-                    }
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(e))) => {
+                    error = Some(format!("upstream stream failed: {e}"));
+                    break 'read;
+                }
+                // Anything left in the parser is an incomplete event and is
+                // dropped, as the SSE spec says.
+                Ok(None) => break 'read,
+            };
+            let events = match parser.push(&chunk) {
+                Ok(events) => events,
+                Err(e) => {
+                    error = Some(e.to_string());
                     break 'read;
                 }
             };
@@ -361,13 +412,17 @@ fn relay(
             }
         }
         recorder.summary.usage = handler.usage();
-        if !failed && !handler.is_finished() {
-            let message = "upstream stream ended before it was complete".to_string();
+        if error.is_none() && !handler.is_finished() {
+            error = Some("upstream stream ended before it was complete".to_string());
+        }
+        if let Some(message) = error {
             for payload in handler.fail(&message) {
                 yield Ok(encode_data(&payload));
             }
             recorder.summary.error = Some(message);
-        } else if !failed {
+        } else if let Some(failure) = handler.failure() {
+            recorder.summary.error = Some(failure);
+        } else {
             recorder.summary.completed = true;
         }
         // Dropping the recorder at the end of the generator reports the
@@ -391,6 +446,7 @@ mod tests {
                 api_key: None,
                 api_key_env: None,
                 timeout_ms: 1000,
+                stream_idle_timeout_ms: 1000,
                 anthropic_version: "2023-06-01".into(),
                 default_max_tokens: 256,
                 headers: BTreeMap::new(),
@@ -528,7 +584,13 @@ mod tests {
         let mut parser = SseParser::new();
         let mut out = Vec::new();
         for chunk in chunks {
-            out.extend(parser.push(&chunk.unwrap()).into_iter().map(|e| e.data));
+            out.extend(
+                parser
+                    .push(&chunk.unwrap())
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| e.data),
+            );
         }
         out
     }
@@ -542,102 +604,181 @@ mod tests {
         )
     }
 
+    fn summary(slot: &Arc<Mutex<Option<StreamSummary>>>) -> StreamSummary {
+        slot.lock().unwrap().clone().expect("recorder reported")
+    }
+
     fn upstream(
-        chunks: Vec<reqwest::Result<Bytes>>,
+        chunks: Vec<&str>,
     ) -> futures_util::stream::BoxStream<'static, reqwest::Result<Bytes>> {
+        let chunks: Vec<reqwest::Result<Bytes>> = chunks
+            .into_iter()
+            .map(|c| Ok(Bytes::from(c.to_string())))
+            .collect();
         futures_util::stream::iter(chunks).boxed()
     }
 
-    fn passthrough(include_usage: bool) -> Box<dyn EventHandler> {
-        Box::new(OpenAiPassthrough {
-            include_usage,
-            usage: None,
-            done: false,
-        })
+    const IDLE: Duration = Duration::from_secs(5);
+
+    fn run(
+        chunks: Vec<&str>,
+        handler: Box<dyn EventHandler>,
+    ) -> (
+        impl Stream<Item = Result<Bytes, io::Error>>,
+        Arc<Mutex<Option<StreamSummary>>>,
+    ) {
+        let (rec, slot) = recorder();
+        (relay(upstream(chunks), handler, rec, IDLE), slot)
     }
 
-    const OPENAI_STREAM: &str = concat!(
-        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+    // What OpenAI sends with include_usage on: `"usage":null` on every chunk,
+    // then a usage-only chunk, then [DONE].
+    const OPENAI_STREAM: [&str; 3] = [
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}],\"usage\":null}\n\n",
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1,\"total_tokens\":6}}\n\n",
         "data: [DONE]\n\n",
-    );
+    ];
 
     #[tokio::test]
-    async fn passthrough_hides_usage_chunk_unless_requested() {
-        let (rec, summary) = recorder();
-        let out = collect(relay(
-            upstream(vec![Ok(Bytes::from(OPENAI_STREAM))]),
-            passthrough(false),
-            rec,
-        ))
-        .await;
-        assert_eq!(out.len(), 2, "{out:?}");
-        assert_eq!(out[1], "[DONE]");
-        let summary = summary.lock().unwrap().clone().unwrap();
+    async fn passthrough_hides_usage_the_client_did_not_ask_for() {
+        let (stream, slot) = run(
+            OPENAI_STREAM.to_vec(),
+            Box::new(OpenAiPassthrough::new(false)),
+        );
+        let out = collect(stream).await;
+        assert_eq!(
+            out,
+            [
+                r#"{"choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+                "[DONE]"
+            ]
+        );
+        let summary = summary(&slot);
         assert!(summary.completed);
+        assert_eq!(summary.error, None);
         assert_eq!(summary.usage.unwrap().prompt_tokens, 5);
-
-        let (rec, _) = recorder();
-        let out = collect(relay(
-            upstream(vec![Ok(Bytes::from(OPENAI_STREAM))]),
-            passthrough(true),
-            rec,
-        ))
-        .await;
-        assert_eq!(out.len(), 3);
     }
 
     #[tokio::test]
-    async fn truncated_stream_gets_an_error_payload() {
-        let (rec, summary) = recorder();
-        let first = OPENAI_STREAM.split("\n\n").next().unwrap().to_string() + "\n\n";
-        let out = collect(relay(
-            upstream(vec![Ok(Bytes::from(first))]),
-            passthrough(false),
-            rec,
-        ))
-        .await;
+    async fn passthrough_keeps_usage_the_client_asked_for() {
+        let (stream, _) = run(
+            OPENAI_STREAM.to_vec(),
+            Box::new(OpenAiPassthrough::new(true)),
+        );
+        let out = collect(stream).await;
+        assert_eq!(out.len(), 3);
+        assert!(out[0].contains(r#""usage":null"#));
+        assert!(out[1].contains(r#""total_tokens":6"#));
+    }
+
+    #[tokio::test]
+    async fn stream_cut_between_events_gets_an_error_payload() {
+        let (stream, slot) = run(
+            vec![OPENAI_STREAM[0]],
+            Box::new(OpenAiPassthrough::new(false)),
+        );
+        let out = collect(stream).await;
         assert_eq!(out.len(), 2);
         assert!(out[1].contains("ended before it was complete"));
-        let summary = summary.lock().unwrap().clone().unwrap();
+        let summary = summary(&slot);
         assert!(!summary.completed);
-        assert!(summary.error.is_some());
+        assert!(summary.error.unwrap().contains("ended before"));
     }
 
     #[tokio::test]
-    async fn abandoned_stream_still_reports() {
-        let (rec, summary) = recorder();
+    async fn stream_cut_mid_event_never_forwards_half_an_event() {
+        let cut = &OPENAI_STREAM[1][..40];
+        let (stream, slot) = run(
+            vec![OPENAI_STREAM[0], cut],
+            Box::new(OpenAiPassthrough::new(false)),
+        );
+        let out = collect(stream).await;
+        assert_eq!(out.len(), 2, "{out:?}");
+        for payload in &out {
+            serde_json::from_str::<Value>(payload).expect("every payload is complete JSON");
+        }
+        assert!(out[1].contains("ended before it was complete"));
+        assert!(summary(&slot).error.is_some());
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_times_out() {
+        let first = futures_util::stream::iter(vec![Ok(Bytes::from(OPENAI_STREAM[0]))]);
+        let stalled = first.chain(futures_util::stream::pending()).boxed();
+        let (rec, slot) = recorder();
         let stream = relay(
-            upstream(vec![Ok(Bytes::from(OPENAI_STREAM))]),
-            passthrough(false),
+            stalled,
+            Box::new(OpenAiPassthrough::new(false)),
             rec,
+            Duration::from_millis(50),
+        );
+        let out = collect(stream).await;
+        assert_eq!(out.len(), 2);
+        assert!(out[1].contains("sent nothing for 50ms"), "{out:?}");
+        assert!(summary(&slot).error.unwrap().contains("sent nothing"));
+    }
+
+    #[tokio::test]
+    async fn upstream_error_event_marks_the_stream_failed() {
+        let (stream, slot) = run(
+            vec![
+                OPENAI_STREAM[0],
+                "data: {\"error\":{\"message\":\"server overloaded\",\"type\":\"server_error\"}}\n\n",
+            ],
+            Box::new(OpenAiPassthrough::new(false)),
+        );
+        let out = collect(stream).await;
+        assert_eq!(out.len(), 2);
+        assert!(out[1].contains("server overloaded"));
+        let summary = summary(&slot);
+        assert!(!summary.completed);
+        assert!(summary.error.unwrap().contains("server overloaded"));
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_reports_without_usage_or_error() {
+        let (stream, slot) = run(
+            OPENAI_STREAM.to_vec(),
+            Box::new(OpenAiPassthrough::new(false)),
         );
         let mut stream = Box::pin(stream);
         let first = stream.next().await.unwrap().unwrap();
         assert!(first.starts_with(b"data: "));
-        assert!(summary.lock().unwrap().is_none());
+        assert!(slot.lock().unwrap().is_none());
         drop(stream);
-        let summary = summary.lock().unwrap().clone().expect("reported on drop");
+        // The client left before OpenAI's final usage chunk, so there is
+        // nothing to bill. The gateway counts these in
+        // llm_gateway_unbilled_streams_total.
+        let summary = summary(&slot);
         assert!(!summary.completed);
+        assert_eq!(summary.usage, None);
+        assert_eq!(summary.error, None);
+    }
+
+    fn anthropic_fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/anthropic/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    fn anthropic_handler() -> Box<dyn EventHandler> {
+        Box::new(AnthropicAdapter {
+            translator: StreamTranslator::new(false, 1),
+        })
     }
 
     #[tokio::test]
     async fn anthropic_stream_is_translated_across_odd_chunk_boundaries() {
-        let sse = std::fs::read_to_string(format!(
-            "{}/tests/fixtures/anthropic/stream_text.sse",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap();
-        let chunks: Vec<reqwest::Result<Bytes>> = sse
+        let sse = anthropic_fixture("stream_text.sse");
+        let chunks: Vec<&str> = sse
             .as_bytes()
             .chunks(7)
-            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .map(|c| std::str::from_utf8(c).unwrap())
             .collect();
-        let (rec, summary) = recorder();
-        let handler = Box::new(AnthropicAdapter {
-            translator: StreamTranslator::new(false, 1),
-        });
-        let out = collect(relay(upstream(chunks), handler, rec)).await;
+        let (stream, slot) = run(chunks, anthropic_handler());
+        let out = collect(stream).await;
         assert_eq!(out.last().map(String::as_str), Some("[DONE]"));
         let text: String = out[..out.len() - 1]
             .iter()
@@ -649,8 +790,24 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "Hello, world");
-        let summary = summary.lock().unwrap().clone().unwrap();
+        let summary = summary(&slot);
         assert!(summary.completed);
         assert_eq!(summary.usage.unwrap().completion_tokens, 4);
+    }
+
+    #[tokio::test]
+    async fn anthropic_error_event_marks_the_stream_failed() {
+        let sse = anthropic_fixture("stream_error.sse");
+        let (stream, slot) = run(vec![sse.as_str()], anthropic_handler());
+        let out = collect(stream).await;
+        assert!(out.last().unwrap().contains("overloaded_error"));
+        let summary = summary(&slot);
+        assert!(!summary.completed);
+        assert_eq!(
+            summary.error.as_deref(),
+            Some("overloaded_error: Overloaded")
+        );
+        // Input tokens from message_start are still known.
+        assert_eq!(summary.usage.unwrap().prompt_tokens, 10);
     }
 }

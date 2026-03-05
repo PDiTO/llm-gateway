@@ -508,3 +508,92 @@ async fn lists_models_and_reports_health() {
     let missing = gw.get("/v1/embeddings").await;
     assert_eq!(missing.status(), 404);
 }
+
+#[tokio::test]
+async fn upstream_404_moves_on_without_tripping_the_circuit() {
+    let (a, b) = pair().await;
+    a.set_default(Behavior::Status {
+        status: 404,
+        body: json!({"error": {"message": "The model `model-a` does not exist", "type": "invalid_request_error"}}),
+        headers: vec![],
+    });
+    let gw = TestGateway::start(&breaker_config(&a.openai_url(), &b.openai_url())).await;
+    for _ in 0..3 {
+        let response = gw.chat(chat_body("smart")).await;
+        assert_eq!(header(&response, "x-gateway-provider"), "b");
+    }
+    assert_eq!(
+        a.hits(),
+        3,
+        "a 404 is not retried, and a keeps getting asked"
+    );
+    let health: Value = gw.get("/healthz").await.json().await.unwrap();
+    assert_eq!(health["circuits"]["a"], "closed");
+
+    // When nobody knows the model, the client gets a 404.
+    b.set_default(Behavior::status(404));
+    let response = gw.chat(chat_body("smart")).await;
+    assert_eq!(response.status(), 404);
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed() {
+    let (a, b) = pair().await;
+    let elsewhere = MockUpstream::start(Behavior::Json(openai_completion(
+        "should not be reached",
+        1,
+        1,
+    )))
+    .await;
+    a.set_default(Behavior::Status {
+        status: 307,
+        body: json!({}),
+        headers: vec![(
+            "location",
+            format!("{}/chat/completions", elsewhere.openai_url()),
+        )],
+    });
+    let gw = TestGateway::start(&two_provider_config(&a.openai_url(), &b.openai_url(), "")).await;
+
+    let response = gw.chat(chat_body("smart")).await;
+    assert_eq!(header(&response, "x-gateway-provider"), "b");
+    assert_eq!(
+        elsewhere.hits(),
+        0,
+        "credentials must not follow a redirect"
+    );
+    assert_eq!(a.hits(), 1);
+}
+
+#[tokio::test]
+async fn circuit_opening_mid_retry_keeps_the_real_failure_status() {
+    let (a, b) = pair().await;
+    a.set_default(Behavior::Hang);
+    // Only target a; the circuit opens on the first timeout, which blocks
+    // the retry. The client should still see a timeout, not "circuit open".
+    let config = format!(
+        r#"
+{FAST_RETRY}
+[circuit_breaker]
+failure_threshold = 1
+
+[providers.a]
+kind = "openai"
+base_url = "{}"
+timeout_ms = 100
+
+[[models]]
+name = "only-a"
+targets = [{{ provider = "a", model = "model-a" }}]
+
+{}
+"#,
+        a.openai_url(),
+        default_keys()
+    );
+    let gw = TestGateway::start(&config).await;
+    let response = gw.chat(chat_body("only-a")).await;
+    assert_eq!(response.status(), 504);
+    assert_eq!(a.hits(), 1);
+    drop(b);
+}

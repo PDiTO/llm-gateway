@@ -88,11 +88,15 @@ async fn openai_stream_is_relayed_chunk_by_chunk() {
     let events = read_sse(response).await;
 
     // role chunk, 4 words, finish chunk, [DONE]. The usage chunk the gateway
-    // asked for on the client's behalf is hidden.
+    // asked for on the client's behalf is hidden, and so is the
+    // `"usage":null` OpenAI adds to every other chunk.
     let payloads: Vec<&str> = events.iter().map(|(data, _)| data.as_str()).collect();
     assert_eq!(payloads.len(), 7, "{payloads:#?}");
     assert_eq!(payloads.last(), Some(&"[DONE]"));
-    assert!(payloads.iter().all(|p| !p.contains("\"usage\"")));
+    assert!(
+        payloads.iter().all(|p| !p.contains("usage")),
+        "{payloads:#?}"
+    );
     let text: String = payloads[..payloads.len() - 1]
         .iter()
         .map(|p| serde_json::from_str::<Value>(p).unwrap())
@@ -146,7 +150,7 @@ async fn usage_chunk_is_kept_when_the_client_asks_for_it() {
     let usage: Vec<Value> = events
         .iter()
         .filter_map(|(d, _)| serde_json::from_str::<Value>(d).ok())
-        .filter(|c| c.get("usage").is_some())
+        .filter(|c| c["usage"].is_object())
         .collect();
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0]["usage"]["total_tokens"], 5);
@@ -237,8 +241,26 @@ async fn anthropic_errors_are_translated_into_openai_errors() {
 }
 
 #[tokio::test]
-async fn untranslatable_requests_are_rejected_with_400() {
-    let (_, anthropic, gw) = setup().await;
+async fn untranslatable_requests_fall_back_or_get_a_400() {
+    let (openai, anthropic, gw) = setup().await;
+
+    // Anthropic can't do n > 1 or JSON mode. With an OpenAI target behind it,
+    // the request goes there.
+    for extra in [
+        json!({"n": 3}),
+        json!({"response_format": {"type": "json_object"}}),
+    ] {
+        let mut body = chat_body("claude-then-gpt");
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let response = gw.chat(body).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(header(&response, "x-gateway-provider"), "openai");
+    }
+    assert_eq!(openai.hits(), 2);
+
+    // With only an Anthropic target, the client gets the translation error.
     let mut body = chat_body("claude");
     body["n"] = json!(3);
     let response = gw.chat(body).await;
@@ -366,5 +388,65 @@ async fn truncated_upstream_stream_ends_with_an_error() {
             .as_str()
             .unwrap()
             .contains("ended before")
+    );
+}
+
+#[tokio::test]
+async fn stalled_stream_hits_the_idle_timeout() {
+    let (openai, _, _) = setup().await;
+    let config = config(&openai.openai_url(), "http://127.0.0.1:9").replace(
+        "api_key = \"sk-upstream-openai\"",
+        "api_key = \"sk-upstream-openai\"\nstream_idle_timeout_ms = 150",
+    );
+    let gw = TestGateway::start(&config).await;
+    openai.set_default(Behavior::Stream {
+        chunks: openai_stream(&["slow"], 1, 1),
+        delay: Duration::from_millis(600),
+    });
+
+    let started = std::time::Instant::now();
+    let events = read_sse(gw.chat(stream_body("gpt", false)).await).await;
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    let last: Value = serde_json::from_str(&events.last().unwrap().0).unwrap();
+    assert!(
+        last["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sent nothing for 150ms"),
+        "{last}"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_that_fails_midway_counts_against_the_circuit() {
+    let openai = MockUpstream::start(Behavior::sse(openai_stream(&["ok"], 1, 1))).await;
+    let anthropic = MockUpstream::start(Behavior::sse(sse_events(&fixture(
+        "anthropic/stream_error.sse",
+    ))))
+    .await;
+    let config = config(&openai.openai_url(), &anthropic.anthropic_url())
+        + "\n[circuit_breaker]\nfailure_threshold = 1\n";
+    let gw = TestGateway::start(&config).await;
+
+    // The stream starts fine (200, headers sent) and then Anthropic reports
+    // overloaded_error mid-way.
+    let response = gw.chat(stream_body("claude-then-gpt", false)).await;
+    assert_eq!(header(&response, "x-gateway-provider"), "anthropic");
+    read_sse(response).await;
+
+    // That opened Anthropic's circuit, so the next request goes to OpenAI.
+    let response = gw.chat(stream_body("claude-then-gpt", false)).await;
+    assert_eq!(header(&response, "x-gateway-provider"), "openai");
+    read_sse(response).await;
+    assert_eq!(anthropic.hits(), 1);
+
+    let metrics = gw.metrics().await;
+    assert_eq!(
+        metric_value(
+            &metrics,
+            r#"llm_gateway_upstream_attempts_total{outcome="stream_failed",provider="anthropic"}"#
+        ),
+        Some(1.0),
+        "{metrics}"
     );
 }

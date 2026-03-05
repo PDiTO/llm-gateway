@@ -7,14 +7,21 @@ use crate::openai::TokenUsage;
 
 const PER_MILLION: f64 = 1_000_000.0;
 
-/// USD cost of one response. Cached prompt tokens are billed at the cached
-/// rate when one is configured, and at the normal input rate otherwise.
+/// USD cost of one response. Cache reads and cache writes are billed at
+/// their own rates when configured, and at the normal input rate otherwise.
 pub fn cost_usd(price: &Price, usage: TokenUsage) -> f64 {
+    // Clamp so an upstream reporting inconsistent counts can't produce a
+    // negative or inflated cost.
     let cached = usage.cached_prompt_tokens.min(usage.prompt_tokens);
-    let uncached = usage.prompt_tokens - cached;
-    let cached_rate = price.cached_input_per_mtok.unwrap_or(price.input_per_mtok);
+    let written = usage
+        .cache_write_prompt_tokens
+        .min(usage.prompt_tokens - cached);
+    let uncached = usage.prompt_tokens - cached - written;
+    let read_rate = price.cached_input_per_mtok.unwrap_or(price.input_per_mtok);
+    let write_rate = price.cache_write_per_mtok.unwrap_or(price.input_per_mtok);
     (uncached as f64 * price.input_per_mtok
-        + cached as f64 * cached_rate
+        + cached as f64 * read_rate
+        + written as f64 * write_rate
         + usage.completion_tokens as f64 * price.output_per_mtok)
         / PER_MILLION
 }
@@ -48,6 +55,7 @@ mod tests {
             prompt_tokens: prompt,
             completion_tokens: completion,
             cached_prompt_tokens: cached,
+            cache_write_prompt_tokens: 0,
         }
     }
 
@@ -59,6 +67,7 @@ mod tests {
         input_per_mtok: 2.0,
         output_per_mtok: 10.0,
         cached_input_per_mtok: Some(0.2),
+        cache_write_per_mtok: Some(2.5),
     };
 
     #[test]
@@ -67,6 +76,7 @@ mod tests {
             input_per_mtok: 1.0,
             output_per_mtok: 5.0,
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
         };
         // 1M in at $1 + 200k out at $5.
         assert!(close(cost_usd(&price, usage(1_000_000, 200_000, 0)), 2.0));
@@ -80,9 +90,21 @@ mod tests {
     }
 
     #[test]
+    fn cache_writes_use_the_write_rate() {
+        // 3,500 prompt tokens: 1,200 plain, 300 written to cache, 2,000 read.
+        let usage = TokenUsage {
+            cache_write_prompt_tokens: 300,
+            ..usage(3_500, 95, 2_000)
+        };
+        let expected = (1_200.0 * 2.0 + 300.0 * 2.5 + 2_000.0 * 0.2 + 95.0 * 10.0) / 1e6;
+        assert!(close(cost_usd(&SONNET, usage), expected));
+    }
+
+    #[test]
     fn cached_tokens_fall_back_to_the_input_rate() {
         let price = Price {
             cached_input_per_mtok: None,
+            cache_write_per_mtok: None,
             ..SONNET
         };
         assert!(close(

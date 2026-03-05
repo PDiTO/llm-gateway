@@ -180,6 +180,7 @@ impl AnthropicUsage {
             prompt_tokens: input + written + read,
             completion_tokens: self.output_tokens.unwrap_or(0),
             cached_prompt_tokens: read,
+            cache_write_prompt_tokens: written,
         }
     }
 
@@ -209,6 +210,29 @@ pub fn translate_request(
         return Err(ApiError::invalid_request(
             "n > 1 is not supported for Anthropic models",
         ));
+    }
+    // JSON mode can't be honoured by this adapter. Failing here lets the
+    // gateway try a later target that supports it, instead of quietly
+    // returning prose to a client that asked for JSON.
+    if let Some(format) = request.extra.get("response_format") {
+        let kind = format.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind != "text" {
+            return Err(ApiError::invalid_request(format!(
+                "response_format {kind:?} is not supported for Anthropic models"
+            )));
+        }
+    }
+    let ignored: Vec<&str> = request
+        .extra
+        .keys()
+        .map(String::as_str)
+        .filter(|k| *k != "response_format")
+        .collect();
+    if !ignored.is_empty() {
+        tracing::debug!(
+            fields = ?ignored,
+            "dropping request fields with no Anthropic equivalent"
+        );
     }
 
     let mut system = Vec::new();
@@ -607,7 +631,7 @@ pub struct StreamTranslator {
     /// Anthropic content block index -> OpenAI tool call index.
     tool_indices: HashMap<u32, u32>,
     finished: bool,
-    failed: bool,
+    failure: Option<String>,
 }
 
 impl StreamTranslator {
@@ -621,7 +645,7 @@ impl StreamTranslator {
             started: false,
             tool_indices: HashMap::new(),
             finished: false,
-            failed: false,
+            failure: None,
         }
     }
 
@@ -632,7 +656,12 @@ impl StreamTranslator {
 
     /// True if the stream ended with an error event.
     pub fn failed(&self) -> bool {
-        self.failed
+        self.failure.is_some()
+    }
+
+    /// The error message, if the stream ended with an error event.
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
     }
 
     /// Usage so far. `None` until `message_start` has been seen.
@@ -740,7 +769,7 @@ impl StreamTranslator {
     /// with an `error` key.
     pub fn fail(&mut self, kind: &str, message: &str) -> Vec<String> {
         self.finished = true;
-        self.failed = true;
+        self.failure = Some(format!("{kind}: {message}"));
         vec![
             json!({"error": {"message": message, "type": kind, "param": null, "code": null}})
                 .to_string(),
@@ -828,11 +857,7 @@ mod tests {
         let mut parser = SseParser::new();
         let mut translator = StreamTranslator::new(include_usage, CREATED);
         let mut out = Vec::new();
-        for event in parser
-            .push(sse.as_bytes())
-            .into_iter()
-            .chain(parser.finish())
-        {
+        for event in parser.push(sse.as_bytes()).unwrap() {
             out.extend(translator.on_event(&event));
         }
         (out, translator)
@@ -977,6 +1002,15 @@ mod tests {
                 .contains("unsupported content part")
         );
 
+        let json_mode = translate(
+            json!({"model": "m", "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        assert!(json_mode.unwrap_err().message.contains("json_object"));
+        let text_mode = translate(json!({"model": "m", "response_format": {"type": "text"},
+            "messages": [{"role": "user", "content": "hi"}]}));
+        assert!(text_mode.is_ok());
+
         let bad_data_url = translate(
             json!({"model": "m", "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": "data:image/png,rawbytes"}}
@@ -1077,7 +1111,7 @@ mod tests {
             Some(TokenUsage {
                 prompt_tokens: 25,
                 completion_tokens: 4,
-                cached_prompt_tokens: 0
+                ..TokenUsage::default()
             })
         );
     }
@@ -1160,7 +1194,7 @@ mod tests {
         assert_eq!(error["error"]["type"], "overloaded_error");
         assert_eq!(error["error"]["message"], "Overloaded");
         assert!(translator.is_finished());
-        assert!(translator.failed());
+        assert_eq!(translator.failure(), Some("overloaded_error: Overloaded"));
         assert!(!payloads.contains(&"[DONE]".to_string()));
     }
 

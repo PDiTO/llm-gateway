@@ -176,8 +176,12 @@ pub struct ProviderConfig {
     /// Name of the environment variable holding the API key.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Time allowed until response headers (streams) or the whole response.
     #[serde(default = "defaults::provider_timeout_ms")]
     pub timeout_ms: u64,
+    /// Longest gap allowed between chunks of a stream once it has started.
+    #[serde(default = "defaults::stream_idle_timeout_ms")]
+    pub stream_idle_timeout_ms: u64,
     /// Sent as `anthropic-version`. Only used by `kind = "anthropic"`.
     #[serde(default = "defaults::anthropic_version")]
     pub anthropic_version: String,
@@ -236,9 +240,14 @@ pub struct Price {
     pub input_per_mtok: f64,
     /// USD per million output tokens.
     pub output_per_mtok: f64,
-    /// USD per million cached input tokens. Defaults to the input price.
+    /// USD per million cached input tokens (cache reads). Defaults to the
+    /// input price.
     #[serde(default)]
     pub cached_input_per_mtok: Option<f64>,
+    /// USD per million tokens written to the prompt cache. Anthropic reports
+    /// these separately and charges more for them. Defaults to the input price.
+    #[serde(default)]
+    pub cache_write_per_mtok: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -291,6 +300,9 @@ mod defaults {
         300
     }
     pub fn provider_timeout_ms() -> u64 {
+        60_000
+    }
+    pub fn stream_idle_timeout_ms() -> u64 {
         60_000
     }
     pub fn anthropic_version() -> String {
@@ -405,6 +417,11 @@ impl Config {
             if provider.timeout_ms == 0 {
                 errors.push(format!("{at}.timeout_ms must be greater than 0"));
             }
+            if provider.stream_idle_timeout_ms == 0 {
+                errors.push(format!(
+                    "{at}.stream_idle_timeout_ms must be greater than 0"
+                ));
+            }
             if provider.default_max_tokens == 0 {
                 errors.push(format!("{at}.default_max_tokens must be greater than 0"));
             }
@@ -500,6 +517,7 @@ impl Config {
                 ("input_per_mtok", Some(price.input_per_mtok)),
                 ("output_per_mtok", Some(price.output_per_mtok)),
                 ("cached_input_per_mtok", price.cached_input_per_mtok),
+                ("cache_write_per_mtok", price.cache_write_per_mtok),
             ];
             for (field, value) in fields {
                 if let Some(v) = value

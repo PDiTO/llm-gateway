@@ -264,12 +264,15 @@ pub struct FunctionCallDelta {
 // Token accounting shared by every provider
 
 /// Token counts the gateway bills on, normalised across providers.
-/// `prompt_tokens` includes `cached_prompt_tokens`, as in OpenAI's usage.
+/// `prompt_tokens` is the total, as in OpenAI's usage: it includes cache
+/// reads (`cached_prompt_tokens`) and cache writes
+/// (`cache_write_prompt_tokens`, which only Anthropic reports).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cached_prompt_tokens: u64,
+    pub cache_write_prompt_tokens: u64,
 }
 
 impl TokenUsage {
@@ -285,6 +288,7 @@ impl TokenUsage {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
+            cache_write_prompt_tokens: 0,
         })
     }
 
@@ -358,7 +362,8 @@ mod tests {
             TokenUsage {
                 prompt_tokens: 100,
                 completion_tokens: 20,
-                cached_prompt_tokens: 60
+                cached_prompt_tokens: 60,
+                cache_write_prompt_tokens: 0,
             }
         );
         assert_eq!(usage.to_openai().total_tokens, 120);

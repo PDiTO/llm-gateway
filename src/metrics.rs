@@ -25,6 +25,10 @@ pub struct Metrics {
     pub key_spend_today_usd: GaugeVec,
     pub circuit_state: IntGaugeVec,
     pub circuit_transitions: IntCounterVec,
+    /// Streams that ended without any usage from the upstream, so they were
+    /// billed at zero. Usually a client hanging up on an OpenAI stream before
+    /// the final usage chunk.
+    pub unbilled_streams: IntCounterVec,
 }
 
 impl Metrics {
@@ -86,6 +90,12 @@ impl Metrics {
             "llm_gateway_circuit_transitions_total",
             "Circuit breaker state changes by provider and new state.",
             &["provider", "to"],
+        );
+        let unbilled_streams = counter(
+            &registry,
+            "llm_gateway_unbilled_streams_total",
+            "Streams that ended without usage from the upstream and were billed at zero.",
+            &["provider"],
         );
 
         let cost_usd = CounterVec::new(
@@ -153,6 +163,7 @@ impl Metrics {
             key_spend_today_usd,
             circuit_state,
             circuit_transitions,
+            unbilled_streams,
         }
     }
 

@@ -1,9 +1,10 @@
 //! Gateway API keys, per-key rate limits and daily spend budgets.
 //!
-//! The config holds only SHA-256 hashes of keys. An incoming key is hashed
-//! and looked up by hash, so plaintext keys never sit in memory or on disk
-//! after the request that carried them, and lookup time doesn't depend on
-//! how much of a guessed key is right.
+//! The config holds only SHA-256 hashes of keys, so a leaked config file
+//! doesn't leak usable keys. An incoming key is hashed and looked up by hash,
+//! which also means lookup time doesn't depend on how much of a guessed key
+//! is right. Keys are long random strings, so an unsalted fast hash is enough
+//! here; this is not a password store.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
