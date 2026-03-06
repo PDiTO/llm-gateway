@@ -1,4 +1,6 @@
-<!-- logo -->
+<p align="center">
+  <img src="docs/logo.png" alt="llm-gateway logo" width="260">
+</p>
 
 # llm-gateway
 
